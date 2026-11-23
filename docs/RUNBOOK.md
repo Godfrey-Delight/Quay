@@ -366,6 +366,18 @@ when no deployment you operate cashes out through an anchor at all. A
 payments-only mainnet (`OFFRAMP=none`) does not need the probe, but it is not a
 reason to disable it while testnet still does.
 
+### Nightly path payment probe
+
+`.github/workflows/anchor-probe.yml` runs `apps/api/test/live/path-payment.live.test.ts`
+nightly with `RUN_LIVE_PATH_TESTS=1`. It verifies the end-to-end "pay with any asset"
+loop on live Stellar testnet (quoting strict-receive payment paths from Horizon,
+handling slippage, submitting a `path_payment_strict_receive`, and confirming receipt).
+
+**Production go-live requirement:** Turning `PATH_PAYMENTS_ENABLED=true` on in
+production (issue 8.30) strictly requires this nightly job to be green. Path
+payments stay disabled on mainnet until this live testnet suite has passed.
+See [Paying in any asset](PAY-WITH-ANY-ASSET.md) for configuration and operator details.
+
 ## Deploy
 
 Render deploys `apps/api` as a single Docker web service. The starter plan is
