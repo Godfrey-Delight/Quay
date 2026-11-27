@@ -46,7 +46,7 @@ that"; 404 means "nothing here that is yours."
 API keys carry granular permission scopes (`ALL_SCOPES`). Session tokens from `POST /auth`
 represent the logged-in seller and implicitly hold all scopes.
 When minting an API key via `POST /api-keys`, omitting `scopes` assigns `DEFAULT_SCOPES`
-(`links:read`, `links:write`, `invoices:read`, `invoices:write`, `webhooks:manage`).
+(`links:read`, `links:write`, `webhooks:manage`).
 Sensitive capabilities (`offramp:initiate`, `api-keys:manage`) are opt-in and must be explicitly requested.
 Privilege escalation is prevented: an API key can only mint keys whose scopes are a subset of its own.
 
@@ -54,8 +54,8 @@ Privilege escalation is prevented: an API key can only mint keys whose scopes ar
 | --- | --- | --- | --- |
 | `links:read` | Read payment links, details, quotes, and export CSVs | `GET /links/export/csv`<br>`GET /links/:id/detail`<br>`GET /links/:id/offramp-preview`<br>`GET /links/:id/offramp-requirements`<br>`GET /links/:id/cash-out/quote` | Yes |
 | `links:write` | Mutate and cancel payment links | `POST /links/:id/cancel` | Yes |
-| `invoices:read` | Read invoices, list with status filters, view details, and download invoice PDFs | `GET /invoices`<br>`GET /invoices/:id`<br>`GET /invoices/:id/pdf` | Yes |
-| `invoices:write` | Create drafts, update drafts, delete drafts, issue invoices, and void invoices | `POST /invoices`<br>`PATCH /invoices/:id`<br>`DELETE /invoices/:id`<br>`POST /invoices/:id/issue`<br>`POST /invoices/:id/void` | Yes |
+| `invoices:read` | *(Planned, behind `INVOICES_ENABLED`)* Read invoices, list with status filters, view details, and download invoice PDFs | `GET /invoices`<br>`GET /invoices/:id`<br>`GET /invoices/:id/pdf` | Planned (not yet on `dev`) |
+| `invoices:write` | *(Planned, behind `INVOICES_ENABLED`)* Create drafts, update drafts, delete drafts, issue invoices, and void invoices | `POST /invoices`<br>`PATCH /invoices/:id`<br>`DELETE /invoices/:id`<br>`POST /invoices/:id/issue`<br>`POST /invoices/:id/void` | Planned (not yet on `dev`) |
 | `webhooks:manage` | Register, list, delete and rotate webhooks, and read or replay deliveries | every `/webhooks` route: `POST /webhooks`<br>`GET /webhooks`<br>`DELETE /webhooks/:id`<br>`POST /webhooks/:id/rotate-secret`<br>`GET /webhooks/:id/deliveries`<br>`POST /webhooks/deliveries/:id/replay` | Yes |
 | `api-keys:manage` | Create, list, and revoke API keys | `POST /api-keys`<br>`GET /api-keys`<br>`DELETE /api-keys/:id` | No (opt-in) |
 | `offramp:initiate` | Initiate off-ramp cash-out, submit transfers, manage KYC, and anchor sessions | `POST /links/:id/cash-out`<br>`GET /links/:id/cash-out/transfer`<br>`POST /links/:id/cash-out/transfer-sent`<br>every `/seller/kyc` route (`GET`/`PUT /seller/kyc`, `PUT /seller/kyc/files`, `/seller/kyc/disclosures`, `/seller/kyc/consent`, `/seller/kyc/prefill-consent`; the consent, prefill-consent, disclosure and file routes are additionally session-only)<br>`GET /seller/anchor-auth`<br>`POST /seller/anchor-auth/challenge`<br>`POST /seller/anchor-auth`<br>`DELETE /seller/anchor-auth` | No (opt-in) |
@@ -783,6 +783,8 @@ settled.
 ---
 
 ## Invoices
+
+> **Planned (behind `INVOICES_ENABLED`, not yet on `dev`):** The `/invoices` routes, `invoices:read` / `invoices:write` scopes, and `INVOICES_ENABLED` flag documented below are planned and not yet merged to `dev` or live. When implemented, they will ship behind `INVOICES_ENABLED`.
 
 Invoices allow merchants to bill clients with itemized line items, due dates, and
 sequential invoice numbers (`INV-0001`, `INV-0002`). When an invoice is issued,
@@ -2469,7 +2471,7 @@ registered URL.
 | `link.cancelled`        | seller voided the link                              |
 | `link.expired`          | TTL elapsed before payment confirmed                |
 | `payment.unmatched`     | a payment arrived matching an expired or cancelled link |
-| `invoice.overdue`       | an issued, unpaid invoice reaches its due date (`now > dueAt`) without payment |
+| `invoice.overdue`       | *(Planned, behind `INVOICES_ENABLED`)* an issued, unpaid invoice reaches its due date (`now > dueAt`) without payment |
 | `offramp.settled`       | a cash-out job settled                              |
 | `offramp.failed`        | a cash-out job failed                               |
 | `offramp.transfer_required` | anchor has published deposit instructions; the seller's wallet must send USDC to the anchor to fund the withdrawal |
