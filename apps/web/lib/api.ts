@@ -1,4 +1,5 @@
 import type {
+  AssetRef,
   KycFieldSpec,
   KycStatus,
   OffRampQuote,
@@ -15,6 +16,28 @@ export interface LinkWithRequest {
   request: PaymentRequest;
   /** Paying in any asset (issue 8.30). Optional so older API responses still parse. */
   pay?: { pathPayments: boolean; maxSlippageBps: number };
+}
+
+/** One way to pay a link's outstanding amount with another asset (issue 4.64). */
+export interface PayOption {
+  sourceAsset: AssetRef;
+  /** What the path costs right now, in `sourceAsset`. */
+  sourceAmount: string;
+  /** The most the buyer agrees to spend: `sourceAmount` plus the allowed slippage. */
+  sendMax: string;
+  /** Assets traded through between source and destination, in order. */
+  path: AssetRef[];
+  /** Epoch milliseconds. The quote stands until `expiresAt`. */
+  quotedAt: number;
+  expiresAt: number;
+}
+
+/** `GET /links/:id/pay-options`: what an account can pay a link with (issue 4.64). */
+export interface PayOptions {
+  linkAsset: AssetRef;
+  /** The link's outstanding amount, which every option delivers. */
+  amount: string;
+  options: PayOption[];
 }
 
 /** One SEP-6 withdrawal type and the payout fields it needs (issue 5.24). */
@@ -68,6 +91,11 @@ export interface LinkDetail {
   offrampExternalStatus: string | null;
 }
 
+export interface PaidWithItem {
+  asset: { code: string; issuer?: string | null };
+  amount: string;
+}
+
 /** Fields exposed on the public receipt — never includes seller PII. */
 export interface PublicReceipt {
   reference: string;
@@ -78,6 +106,8 @@ export interface PublicReceipt {
   txHash: string | null;
   payer: string | null;
   paidAmount: string | null;
+  /** What the buyer paid with for path payments (issue 5.50 / 4.66). Null for plain payments. */
+  paidWith?: PaidWithItem[] | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -98,6 +128,27 @@ export interface PublicInvoice {
   sellerDisplayName?: string;
   seller?: string;
   clientName: string;
+  lineItems: InvoiceLineItem[];
+  total: string;
+  asset?: string | { code: string; issuer?: string | null };
+  assetCode?: string;
+  issuedAt: number | null;
+  dueAt: number;
+  status: InvoiceStatus;
+  linkId: string | null;
+  notes?: string | null;
+  reference?: string | null;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface Invoice {
+  id: string;
+  sellerId?: string;
+  number: string | null;
+  clientName: string;
+  clientEmail?: string | null;
+  clientAddress?: string | null;
   lineItems: InvoiceLineItem[];
   total: string;
   asset?: string | { code: string; issuer?: string | null };
@@ -582,6 +633,10 @@ export const api = {
 
   getLink: (id: string) => http<LinkWithRequest>(`/links/${id}`),
 
+  /** Which assets this account can pay the link with, and how much of each (issue 4.64). */
+  getPayOptions: (id: string, account: string) =>
+    http<PayOptions>(`/links/${id}/pay-options?account=${encodeURIComponent(account)}`),
+
   submitPayment: (id: string, signedXdr: string) =>
     http<{ txHash: string }>(`/links/${id}/submit`, {
       method: "POST",
@@ -596,6 +651,11 @@ export const api = {
   getReceipt: (reference: string) => http<PublicReceipt>(`/r/${reference}`),
 
   getPublicInvoice: (id: string) => http<PublicInvoice>(`/invoices/${id}/public`),
+
+  listInvoices: (status?: InvoiceStatus | "all" | string) =>
+    http<{ invoices: Invoice[] }>(
+      `/invoices${status && status !== "all" ? `?status=${encodeURIComponent(status)}` : ""}`,
+    ),
 
   /** Indicative SEP-38 prices for a paid link — no firm quote is consumed. */
   getOfframpPreview: (id: string, currency?: string) =>
