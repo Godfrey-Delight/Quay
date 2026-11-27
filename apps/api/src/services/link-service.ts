@@ -4,6 +4,8 @@ import {
   toStroops,
   assetEquals,
   CannotReceiveError,
+  isPositiveAmount,
+  type CannotReceiveReason,
   canTransition,
   isQuoteExpired,
   QuoteExpiredError,
@@ -49,18 +51,136 @@ import {
   isAnchorRejection,
   truncateAnchorBody,
 } from "@checkout/offramp";
-import { resolveAsset, type StellarConfig } from "@checkout/stellar";
-import { Horizon, Operation, Transaction, type Memo } from "@stellar/stellar-sdk";
+import {
+  isNotFound,
+  isRetryable,
+  quoteStrictReceive,
+  resolveAsset,
+  sendMaxFor,
+  type PathQuote,
+  type StellarConfig,
+} from "@checkout/stellar";
+import { Horizon, Operation, StrKey, Transaction, type Asset, type Memo } from "@stellar/stellar-sdk";
 import { newId, newMuxedId, newReference } from "./ids";
 import { WebhookSender } from "./webhook-sender";
 import { AnchorHealthRegistry, type AnchorHealth, type AnchorHealthSnapshot } from "./anchor-health";
 import { metrics, recordAnchorAuthRequired, type AnchorAuthRoute } from "../metrics";
 import type { PiiAuditRecorder } from "./pii-audit";
+import type { PathPaymentsConfig, PayOptions } from "../path-payments";
 
 // Re-exported for callers that historically imported them from LinkService
 // (issue 3.23 moved the implementation into ./anchor-health).
 export { AnchorHealth, AnchorHealthRegistry } from "./anchor-health";
 export type { AnchorHealthSnapshot, CircuitState, Sep10Probe, AnchorProbeConfig } from "./anchor-health";
+
+type RefundDestinationResolution =
+  | { kind: "ready" | "needs_memo"; destination: string }
+  | { kind: "account_gone" };
+
+type RefundPreflightReason = CannotReceiveReason | "memo_required";
+
+export type RefundPreflightResult =
+  | { ok: true; destination: string; memoRequired: boolean }
+  | { ok: false; reason: RefundPreflightReason; message: string };
+
+const refundPreflightMessages: Record<RefundPreflightReason, string> = {
+  account_not_found: "The buyer's Stellar account no longer exists. Ask them for a valid refund address.",
+  no_trustline: "The buyer's account can't hold this asset. Ask them to add the required trustline or provide another address.",
+  trustline_not_authorized: "The buyer's trustline is not authorized. Ask them to resolve this with the asset issuer.",
+  trustline_limit_exceeded: "The buyer's trustline lacks capacity for this refund. Ask them to increase the limit or provide another address.",
+  memo_required: "The buyer's account requires a memo. Ask them for the correct deposit memo before sending the refund.",
+};
+
+function refundPreflightFailure(reason: RefundPreflightReason): RefundPreflightResult {
+  return { ok: false, reason, message: refundPreflightMessages[reason] };
+}
+
+/** Horizon account slice refund preflight needs. `dataAttr` is `data_attr` (base64 values). */
+export interface RefundAccountSnapshot {
+  exists: boolean;
+  dataAttr: Record<string, string>;
+}
+
+/**
+ * SEP-29: `config.memo_required` = `"1"` means a payment to this account is
+ * lost without a memo. Horizon stores the value base64-encoded; `"1"` and
+ * `"0"` are also accepted already decoded.
+ */
+export function accountRequiresMemo(dataAttr: Record<string, string> | null | undefined): boolean {
+  if (!dataAttr) return false;
+  const raw = dataAttr["config.memo_required"];
+  if (typeof raw !== "string" || raw.length === 0) return false;
+  return decodeAccountDataValue(raw) === "1";
+}
+
+function decodeAccountDataValue(raw: string): string {
+  if (raw === "1" || raw === "0") return raw;
+  const decoded = Buffer.from(raw, "base64").toString("utf8");
+  if (decoded === "1" || decoded === "0") return decoded;
+  return raw;
+}
+
+/**
+ * TODO(2.14): replace with `resolveRefundDestination` from `@checkout/stellar`
+ * (issue #533, https://github.com/determined-001/Quay/issues/533). That
+ * version also keeps the payer's M-address. `link_payments` has no
+ * `payer_muxed` column yet, so the destination here is the recorded G-address.
+ * The memo flag still comes from the account's SEP-29 entry, not a constant.
+ */
+export function resolveRefundDestination(
+  payment: { payer: string },
+  account: RefundAccountSnapshot,
+): RefundDestinationResolution {
+  if (!account.exists) return { kind: "account_gone" };
+  if (accountRequiresMemo(account.dataAttr)) return { kind: "needs_memo", destination: payment.payer };
+  return { kind: "ready", destination: payment.payer };
+}
+
+/** `<txHash>:<operationId>` as the preflight query names a recorded payment. */
+export function parseRefundPaymentKey(paymentKey: string): { txHash: string; operationId: string } | null {
+  const colon = paymentKey.indexOf(":");
+  if (colon <= 0 || colon === paymentKey.length - 1) return null;
+  const txHash = paymentKey.slice(0, colon);
+  const operationId = paymentKey.slice(colon + 1);
+  if (!txHash || !operationId || txHash !== txHash.trim() || operationId !== operationId.trim()) return null;
+  return { txHash, operationId };
+}
+
+/** Check a resolved destination after the caller verifies the payment and refund eligibility.
+ * The payment's recorded payer is the base G-address, even for a muxed destination.
+ *
+ * `accountData` is the destination account's Horizon `data_attr`. `memoRequired`
+ * is computed from that entry (and from a `needs_memo` resolution), not hardcoded.
+ * A `needs_memo` resolution with no confirming entry is still the typed
+ * `memo_required` failure: the seller has to supply a memo before anything is built.
+ * When the entry itself is `"1"`, the destination can receive and the success
+ * result carries `memoRequired: true`.
+ */
+export async function checkRefundReceivingCapability(
+  rail: Pick<RailPort, "assertCanReceive">,
+  payment: { payer: string },
+  asset: AssetRef,
+  amount: string,
+  resolution: RefundDestinationResolution,
+  accountData?: Record<string, string> | null,
+): Promise<RefundPreflightResult> {
+  if (amount !== amount.trim() || !isPositiveAmount(amount)) {
+    throw new HttpError(400, "invalid_refund_amount");
+  }
+  if (resolution.kind === "account_gone") return refundPreflightFailure("account_not_found");
+
+  try {
+    await rail.assertCanReceive(payment.payer, asset, amount);
+  } catch (error) {
+    if (error instanceof CannotReceiveError) return refundPreflightFailure(error.reason);
+    throw error;
+  }
+
+  const fromAccount = accountRequiresMemo(accountData);
+  const memoRequired = resolution.kind === "needs_memo" || fromAccount;
+  if (resolution.kind === "needs_memo" && !fromAccount) return refundPreflightFailure("memo_required");
+  return { ok: true, destination: resolution.destination, memoRequired };
+}
 
 export interface LinkWithRequest {
   link: PaymentLink;
@@ -204,6 +324,17 @@ export class LinkService {
       logger?: Logger;
       /** Audit log for system reads of seller identity (the cash-out KYC gate). Omitted = not audited. */
       piiAudit?: PiiAuditRecorder;
+      /**
+       * Paying a link with another asset (issues 8.30, 4.64). Omitted, or with
+       * `enabled` false, the feature is off and `getPayOptions` answers 501.
+       */
+      pathPayments?: PathPaymentsConfig;
+      /**
+       * Buyer's Horizon account for refund preflight. Tests inject this.
+       * Omitted, the service loads it from Horizon. TODO(2.14): drop this once
+       * `resolveRefundDestination` takes the account itself.
+       */
+      loadRefundAccount?: (accountId: string) => Promise<RefundAccountSnapshot>;
     },
   ) {
     this.deps.logger = this.deps.logger ?? NOOP_LOGGER;
@@ -478,6 +609,9 @@ export class LinkService {
         amount: normalizeAmount(payment.amount),
         asset: payment.asset,
         ledger: payment.ledger,
+        // The buyer's side of a path payment (issue 4.66); null for a plain one.
+        sourceAsset: payment.sourceAsset ?? null,
+        sourceAmount: payment.sourceAmount ?? null,
         createdAt: Date.now(),
       });
       const cumulative = await this.deps.links.sumPaymentsForLink(link.id);
@@ -516,6 +650,9 @@ export class LinkService {
         amount: normalizeAmount(payment.amount),
         asset: payment.asset,
         ledger: payment.ledger,
+        // The buyer's side of a path payment (issue 4.66); null for a plain one.
+        sourceAsset: payment.sourceAsset ?? null,
+        sourceAmount: payment.sourceAmount ?? null,
         createdAt: Date.now(),
       });
       const cumulative = await this.deps.links.sumPaymentsForLink(link.id);
@@ -594,14 +731,32 @@ export class LinkService {
       );
     }
     const op = tx.operations[0]!;
-    if (op.type !== "payment") {
+    // A strict-receive path payment is a second accepted shape while paying
+    // with another asset is switched on (issues 8.30, 4.65). With the switch
+    // off nothing here changes: it is refused like any other operation.
+    const paths = this.deps.pathPayments?.enabled ? this.deps.pathPayments : undefined;
+    const pathPayment =
+      paths && op.type === "pathPaymentStrictReceive" ? (op as Operation.PathPaymentStrictReceive) : null;
+    if (op.type !== "payment" && !pathPayment) {
+      if (paths && op.type === "pathPaymentStrictSend") {
+        // Strict-send fixes what the buyer spends and lets what arrives float.
+        throw new HttpError(
+          400,
+          'Transaction must be a payment or a strict-receive path payment, got "pathPaymentStrictSend": ' +
+            "a strict-send path payment can deliver less than the link asks for",
+        );
+      }
       throw new HttpError(400, `Transaction must be a single payment operation, got "${op.type}"`);
     }
-    const payment = op as Operation.Payment;
+    // What the operation delivers, whichever of the two it is. Every check
+    // from here to the memo is on the destination side, and holds for both.
+    const payment = pathPayment
+      ? { destination: pathPayment.destination, asset: pathPayment.destAsset, amount: pathPayment.destAmount }
+      : (op as Operation.Payment);
 
     // A per-operation source lets the envelope move value out of an account
     // other than the signer's. Nothing about this flow needs it.
-    if (payment.source && payment.source !== tx.source) {
+    if (op.source && op.source !== tx.source) {
       throw new HttpError(400, "Payment operation must not override the transaction source account");
     }
 
@@ -617,12 +772,7 @@ export class LinkService {
       throw new HttpError(409, "Transaction destination does not match the link destination");
     }
 
-    // `getIssuer()` is typed as possibly-undefined even on a non-native asset;
-    // normalise to null so `assetEquals` compares like with like rather than
-    // silently treating an issued asset as native.
-    const txAsset: AssetRef = payment.asset.isNative()
-      ? { code: "XLM", issuer: null }
-      : { code: payment.asset.getCode(), issuer: payment.asset.getIssuer() ?? null };
+    const txAsset = assetRefOf(payment.asset);
     if (!assetEquals(txAsset, link.asset)) {
       throw new HttpError(
         409,
@@ -634,8 +784,7 @@ export class LinkService {
     // accounting. For an underpaid link, only the outstanding amount remains
     // due; requiring the original invoice amount here would make the wallet
     // path unable to complete split payments.
-    const outstandingStroops = toStroops(link.amount) - (link.paidAmount ? toStroops(link.paidAmount) : 0n);
-    const outstanding = fromStroops(outstandingStroops > 0n ? outstandingStroops : 0n);
+    const outstanding = outstandingAmount(link);
     if (compareAmount(payment.amount, outstanding) === "under") {
       throw new HttpError(
         409,
@@ -651,6 +800,8 @@ export class LinkService {
         throw new HttpError(409, "Transaction memo does not match the link reference");
       }
     }
+
+    if (pathPayment) await this.assertPathPaymentIsBounded(tx, pathPayment, link, paths!, log);
 
     const server = new Horizon.Server(this.deps.stellar.horizonUrl);
     try {
@@ -676,6 +827,174 @@ export class LinkService {
       log.warn({ event: "payment.submit.failed", linkId: link.id, error: detail, reason }, "wallet submit rejected");
       throw new HttpError(409, "payment_rejected", { reason, detail });
     }
+  }
+
+  /**
+   * What a path payment has to pass beyond a plain payment's checks (issue
+   * 4.65). It has a source side a plain payment does not: an asset, a path,
+   * and the most the buyer agrees to spend. A broken or tampered checkout can
+   * set those against the buyer, and a signed transaction with no near expiry
+   * can land minutes later at a much worse price.
+   *
+   * The cheap checks come first. The quote is last, so Horizon is asked only
+   * about a transaction that is otherwise acceptable.
+   */
+  private async assertPathPaymentIsBounded(
+    tx: Transaction,
+    op: Operation.PathPaymentStrictReceive,
+    link: PaymentLink,
+    config: PathPaymentsConfig,
+    log: Logger,
+  ): Promise<void> {
+    const sendAsset = assetRefOf(op.sendAsset);
+    if (assetEquals(sendAsset, link.asset)) {
+      throw new HttpError(
+        400,
+        `Path payment must send another asset than ${link.asset.code}: pay the link's own asset with a plain payment`,
+      );
+    }
+    if (!config.sourceAssets.some((allowed) => assetEquals(allowed, sendAsset))) {
+      throw new HttpError(409, `Source asset ${sendAsset.code} is not accepted for path payments`, {
+        reason: "source_asset_not_allowed",
+      });
+    }
+    // The protocol's own limit. Refused here so that it is not Horizon that
+    // says so, after everything else was accepted.
+    if (op.path.length > MAX_PATH_ASSETS) {
+      throw new HttpError(
+        400,
+        `Path payment has ${op.path.length} path assets, at most ${MAX_PATH_ASSETS} are allowed`,
+      );
+    }
+
+    // The transaction has to expire with the quote it was built from. Without
+    // a `maxTime`, or with a distant one, it could be held back and submitted
+    // when the path costs the buyer far more, up to `sendMax`.
+    const maxTime = Number(tx.timeBounds?.maxTime ?? 0);
+    if (!Number.isFinite(maxTime) || maxTime <= 0) {
+      throw new HttpError(400, "Path payment must expire: the transaction has no timeBounds.maxTime");
+    }
+    const now = (config.now ?? Date.now)();
+    const latest = Math.floor((now + config.quoteTtlMs + PATH_EXPIRY_GRACE_MS) / 1000);
+    if (maxTime > latest) {
+      throw new HttpError(
+        400,
+        `Path payment expires too late: timeBounds.maxTime is ${maxTime}, at most ${latest} is allowed`,
+      );
+    }
+
+    // `sendMax` against what the path costs now. The checkout adds the allowed
+    // slippage once; twice that is the most a correct checkout can be off by
+    // while a quote stands, so anything above it was not built from a quote.
+    let quotes: PathQuote[];
+    try {
+      quotes = await quoteStrictReceive({
+        client: config.horizon,
+        source: [sendAsset],
+        destAsset: link.asset,
+        destAmount: normalizeAmount(op.destAmount),
+      });
+    } catch (err) {
+      // Fail closed: with no price to hold `sendMax` to, nothing is relayed.
+      log.warn(
+        {
+          event: "payment.submit.quote_failed",
+          linkId: link.id,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        "path payment not relayed: no quote to check it against",
+      );
+      throw new HttpError(503, "horizon_unavailable", { retryable: true });
+    }
+    const quote = quotes.find((candidate) => assetEquals(candidate.sourceAsset, sendAsset));
+    if (!quote) {
+      throw new HttpError(409, "payment_rejected", {
+        reason: "no_path",
+        detail: `No path from ${sendAsset.code} to ${link.asset.code} right now`,
+      });
+    }
+    const limit = sendMaxFor(quote.sourceAmount, 2 * config.maxSlippageBps);
+    if (toStroops(op.sendMax) > toStroops(limit)) {
+      throw new HttpError(409, "payment_rejected", {
+        reason: "price_moved",
+        detail: `sendMax ${normalizeAmount(op.sendMax)} ${sendAsset.code} is above ${limit}, the most allowed for a path that costs ${quote.sourceAmount} now`,
+      });
+    }
+  }
+
+  /**
+   * What a buyer's account can pay this link with besides the link's own
+   * asset, and how much of each it takes right now (issue 4.64).
+   *
+   * The path search runs here and not in the browser, so that the slippage,
+   * the allowlist of source assets and the lifetime of a quote are the
+   * server's. What `submitPayment` later holds a path payment to has to come
+   * from the same place that quoted it.
+   *
+   * Only the outstanding amount is quoted, the amount `submitPayment`
+   * requires, so an underpaid link is not offered a path that pays it twice.
+   */
+  async getPayOptions(linkId: string, account: string, opts: ServiceCallOptions = {}): Promise<PayOptions> {
+    const log = opts.logger ?? this.deps.logger!;
+    const config = this.deps.pathPayments;
+    // The switch comes first: while it is off this endpoint does not exist,
+    // whatever was asked of it.
+    if (!config?.enabled) throw new HttpError(501, "path_payments_disabled");
+    if (!StrKey.isValidEd25519PublicKey(account)) throw new HttpError(400, "invalid_account");
+
+    const link = await this.deps.links.findById(linkId);
+    if (!link) throw new HttpError(404, "not_found");
+    if (link.status !== "active" && link.status !== "underpaid") {
+      throw new HttpError(409, "link_not_payable", { status: link.status });
+    }
+
+    const amount = outstandingAmount(link);
+    // Stamped before Horizon is asked, so a quote never claims to be younger
+    // than it is.
+    const quotedAt = (config.now ?? Date.now)();
+    let quotes: PathQuote[] = [];
+    // Nothing owed is nothing to quote, and Horizon refuses a zero amount.
+    if (toStroops(amount) > 0n) {
+      try {
+        quotes = await quoteStrictReceive({
+          client: config.horizon,
+          source: account,
+          destAsset: link.asset,
+          destAmount: amount,
+        });
+      } catch (err) {
+        // Horizon answers 404 for an account that is not on the ledger. Such a
+        // buyer holds nothing to pay with, which is an answer and not an outage.
+        if (!isNotFound(err)) {
+          const retryable = isRetryable(err);
+          log.warn(
+            {
+              event: "pay_options.quote_failed",
+              linkId: link.id,
+              retryable,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "path quote failed",
+          );
+          // No response, a 429 or a 5xx: Horizon is unavailable and asking
+          // again may work. Any other refusal would be refused again.
+          if (retryable) throw new HttpError(503, "horizon_unavailable", { retryable: true });
+          throw new HttpError(502, "quote_failed", { retryable: false });
+        }
+      }
+    }
+
+    const options = quotes
+      .filter((quote) => config.sourceAssets.some((allowed) => assetEquals(allowed, quote.sourceAsset)))
+      .map((quote) => ({
+        sourceAsset: quote.sourceAsset,
+        sourceAmount: quote.sourceAmount,
+        sendMax: sendMaxFor(quote.sourceAmount, config.maxSlippageBps),
+        path: quote.path,
+        quotedAt,
+        expiresAt: quotedAt + config.quoteTtlMs,
+      }));
+    return { linkAsset: link.asset, amount, options };
   }
 
   async cancelLink(id: string): Promise<PaymentLink> {
@@ -1589,6 +1908,42 @@ export class LinkService {
     await this.fireWebhook(link, "offramp.failed", { reason });
   }
 
+  /**
+   * Whether `amount` of the link asset can land on the buyer who paid
+   * `paymentKey` (`<txHash>:<operationId>`). Runs `assertCanReceive` against
+   * the recorded G-address and `resolveRefundDestination` (stubbed until 2.14).
+   */
+  async refundPreflight(linkId: string, paymentKey: string, amount: string): Promise<RefundPreflightResult> {
+    const link = await this.deps.links.findById(linkId);
+    if (!link) throw new HttpError(404, "not_found");
+
+    const paymentId = parseRefundPaymentKey(paymentKey);
+    if (!paymentId) throw new HttpError(400, "invalid_payment");
+
+    const payments = await this.deps.links.listPaymentsForLink(linkId);
+    const payment = payments.find(
+      (row) => row.txHash === paymentId.txHash && row.operationId === paymentId.operationId,
+    );
+    if (!payment) throw new HttpError(404, "not_found");
+
+    const account = await this.loadRefundAccount(payment.payer);
+    const resolution = resolveRefundDestination(payment, account);
+    return checkRefundReceivingCapability(this.deps.rail, payment, link.asset, amount, resolution, account.dataAttr);
+  }
+
+  private async loadRefundAccount(accountId: string): Promise<RefundAccountSnapshot> {
+    if (this.deps.loadRefundAccount) return this.deps.loadRefundAccount(accountId);
+    const server = new Horizon.Server(this.deps.stellar.horizonUrl);
+    try {
+      const loaded = await server.loadAccount(accountId);
+      const dataAttr = (loaded as { data_attr?: Record<string, string> }).data_attr ?? {};
+      return { exists: true, dataAttr };
+    } catch (err) {
+      if (isNotFound(err)) return { exists: false, dataAttr: {} };
+      throw err;
+    }
+  }
+
   private async fireWebhook(
     link: PaymentLink,
     event: string,
@@ -1734,6 +2089,34 @@ function offRampRejected(err: OffRampRejectedError): HttpError {
     limits: err.limits,
     availableTypes: err.availableTypes,
   });
+}
+
+/** The most intermediate assets the protocol allows in a path payment. */
+const MAX_PATH_ASSETS = 5;
+
+/**
+ * How much later than its quote a path payment may expire: room for the
+ * wallet prompt and for clocks that disagree a little.
+ */
+const PATH_EXPIRY_GRACE_MS = 30_000;
+
+/**
+ * An SDK asset as an `AssetRef`. `getIssuer()` is typed as possibly-undefined
+ * even on a non-native asset; it becomes null so that `assetEquals` compares
+ * like with like and does not take an issued asset for native.
+ */
+function assetRefOf(asset: Asset): AssetRef {
+  return asset.isNative() ? { code: "XLM", issuer: null } : { code: asset.getCode(), issuer: asset.getIssuer() ?? null };
+}
+
+/**
+ * What a link still owes: its amount less what has been paid toward it, never
+ * below zero. An underpaid link owes only this, which is why the submit check
+ * and the path quote both start from it and not from `link.amount`.
+ */
+function outstandingAmount(link: Pick<PaymentLink, "amount" | "paidAmount">): string {
+  const owed = toStroops(link.amount) - (link.paidAmount ? toStroops(link.paidAmount) : 0n);
+  return fromStroops(owed > 0n ? owed : 0n);
 }
 
 export class HttpError extends Error {

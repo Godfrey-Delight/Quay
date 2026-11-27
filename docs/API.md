@@ -112,7 +112,7 @@ Rate limit buckets are keyed by client IP (respecting `trustProxyHops`), or by t
 - **Standard limiter**: `RATE_LIMIT_MAX` requests per window (default 120 req / 60s).
 - **Strict limiter**: `RATE_LIMIT_STRICT_MAX` requests per window (default 20 req / 60s,
   window `RATE_LIMIT_STRICT_WINDOW_MS`), applied to sensitive routes: `POST /links`,
-  `POST /links/:id/submit`, `POST /links/:id/cash-out`, `POST /links/:id/cash-out/transfer-sent`,
+  `GET /links/:id/pay-options`, `POST /links/:id/submit`, `POST /links/:id/cash-out`, `POST /links/:id/cash-out/transfer-sent`,
   `POST /auth`, and `/api-keys/*`. The same budget is also kept as separate buckets per seller for
   `POST /seller/anchor-auth/challenge`, `POST /seller/anchor-auth` and `PUT /seller/kyc`, and per client
   IP for `POST /anchor-callbacks/*`.
@@ -477,9 +477,14 @@ If `from` or `to` cannot be parsed, returns **400** `{ "error": "invalid_query",
 **200** `text/csv; charset=utf-8`
 Content-Disposition: `attachment; filename="quay-links-export.csv"`
 ```csv
-id,reference,title,amount,asset,status,payer,tx_hash,paid_amount,created_at,updated_at,offramp_status
-lnk_y70hu7frwy,pl_8q5g02fczihq,"Order #1042",10.5,USDC,offramp_settled,GAQODF5S...,e2e1a17378c6cd...,10.5,2026-10-25T14:30:56.132Z,2026-10-25T14:31:07.875Z,settled
+id,reference,title,amount,asset,status,payer,tx_hash,paid_amount,created_at,updated_at,offramp_status,paid_with
+lnk_y70hu7frwy,pl_8q5g02fczihq,"Order #1042",10.5,USDC,offramp_settled,GAQODF5S...,e2e1a17378c6cd...,10.5,2026-10-25T14:30:56.132Z,2026-10-25T14:31:07.875Z,settled,"24.1234567 XLM"
 ```
+
+New columns are appended after `offramp_status`, so a consumer reading the
+earlier columns by position keeps working. `paid_with` is the source side of
+each path payment on the link — `<amount> <asset code>`, several payments joined
+with `; ` — and is empty when every payment was a plain payment.
 
 | Status | `error` | When | What the client should do |
 | --- | --- | --- | --- |
@@ -593,6 +598,64 @@ Fires the `link.cancelled` webhook.
 
 ---
 
+## `GET /links/:id/pay-options?account=G...`
+
+**Public — no auth.** Strict-rate-limited. Which assets the buyer's account can
+pay this link with besides the link's own asset, and how much of each it takes
+right now. The API asks Horizon for strict-receive paths from that account to
+the link's asset, for the link's **outstanding** amount: an underpaid link is
+quoted only what it still owes.
+
+Unavailable while `PATH_PAYMENTS_ENABLED` is off, which is the default.
+
+Only assets in `PATH_PAYMENTS_SOURCE_ASSETS` are offered (default `native`, so
+XLM alone). The link's own asset is never an option: paying with it is a plain
+payment.
+
+**200**
+```json
+{
+  "linkAsset": { "code": "USDC", "issuer": "GA5Z..." },
+  "amount": "10",
+  "options": [
+    {
+      "sourceAsset": { "code": "XLM", "issuer": null },
+      "sourceAmount": "24.1234567",
+      "sendMax": "24.3646913",
+      "path": [],
+      "quotedAt": 1763560000000,
+      "expiresAt": 1763560030000
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `amount` | The outstanding amount, in `linkAsset`. Every option delivers exactly this. |
+| `sourceAmount` | What the path costs now, in `sourceAsset`. |
+| `sendMax` | The most the buyer agrees to spend: `sourceAmount` plus `PATH_PAYMENTS_MAX_SLIPPAGE_BPS`, rounded up to the next stroop. |
+| `path` | The assets traded through between source and destination, in order. Empty for a direct trade. |
+| `quotedAt`, `expiresAt` | Epoch milliseconds. `expiresAt` is `quotedAt` plus `PATH_QUOTE_TTL_MS` (default 30000). Ask again once it has passed. |
+
+`options` is empty when the account holds nothing it may pay with, when there
+is no path, and when the account does not exist on the ledger.
+
+The response carries `Cache-Control: no-store`.
+
+**Errors**
+
+| Status | `error` | When | What to do |
+|---|---|---|---|
+| `400` | `invalid_account` | `account` is missing or is not a G-address | Send the buyer's public key |
+| `404` | `not_found` | Unknown link | Check the id |
+| `409` | `link_not_payable` | The link is not `active` or `underpaid`. `status` holds what it is | Nothing to pay |
+| `501` | `path_payments_disabled` | The feature is switched off on this deployment | Offer the link's own asset only |
+| `502` | `quote_failed` | Horizon refused the path search. `retryable` is `false` | Do not retry as is |
+| `503` | `horizon_unavailable` | Horizon did not answer, or answered 429 or 5xx, after retries. `retryable` is `true` | Retry shortly |
+
+---
+
 ## `POST /links/:id/submit`
 
 **Public — no auth.** The buyer submits a transaction signed by their own wallet.
@@ -602,6 +665,25 @@ accepts exactly one payment operation (a standard `payment` or, when
 [`PAY-WITH-ANY-ASSET.md`](PAY-WITH-ANY-ASSET.md)) and verifies the destination,
 asset, amount, and required `MEMO_TEXT` against the link. It never marks the link
 paid directly; the ledger watcher remains the source of truth.
+
+While `PATH_PAYMENTS_ENABLED` is on, the one operation may instead be a
+strict-receive path payment (`path_payment_strict_receive`) built from a
+`GET /links/:id/pay-options` quote. What it delivers is held to the rules of a
+plain payment: `destination`, `destAsset`, `destAmount` (not under the
+outstanding amount), the memo, and no operation-level source. Its source side
+has rules of its own:
+
+- `sendAsset` is on `PATH_PAYMENTS_SOURCE_ASSETS`, and is not the link's asset.
+- `path` holds at most 5 assets.
+- The transaction expires: `timeBounds.maxTime` is set, and is no later than now
+  plus `PATH_QUOTE_TTL_MS` plus 30 seconds.
+- `sendMax` is no more than what the path costs when the transaction is
+  submitted plus twice `PATH_PAYMENTS_MAX_SLIPPAGE_BPS`. The API asks Horizon for
+  that price itself.
+
+A strict-send path payment (`path_payment_strict_send`) is never accepted: it
+fixes what the buyer spends and can deliver less than the link asks for. With
+the switch off none of this applies, and only a plain payment is accepted.
 
 **Request**
 ```json
@@ -614,12 +696,26 @@ paid directly; the ledger watcher remains the source of truth.
 ```
 
 **400** — malformed XDR, fee-bump envelope, or a transaction containing anything
-other than exactly one payment operation.
+other than exactly one payment operation (or, with path payments on, one
+strict-receive path payment). Also a path payment that sends the link's own
+asset, has no `timeBounds.maxTime`, or expires too late.
 
 **409** — the link is unavailable, or the transaction does not match the link.
 A Horizon rejection returns `{ "error": "payment_rejected", "reason": "...", "detail": "..." }`,
 where `reason` can distinguish `insufficient_balance`, `missing_trustline`, `price_moved`, `no_path`, or a
 generic `payment_rejected`.
+
+A path payment is also refused with 409, before anything reaches Horizon, when:
+
+| `error` | `reason` | When |
+|---|---|---|
+| `Source asset <code> is not accepted for path payments` | `source_asset_not_allowed` | `sendAsset` is not on the allowlist |
+| `payment_rejected` | `no_path` | There is no path from `sendAsset` to the link's asset right now |
+| `payment_rejected` | `price_moved` | `sendMax` is above the limit for what the path costs now. `detail` gives both figures. Get a new quote |
+
+**503** — `{ "error": "horizon_unavailable", "retryable": true }`: Horizon could
+not give the price to check a path payment's `sendMax` against. Nothing was
+relayed.
 
 ---
 
@@ -647,10 +743,18 @@ An `active`, `underpaid`, `expired` or `cancelled` link returns
   "txHash": "b166269ace8a96efe...",
   "payer": "G...",
   "paidAmount": "3",
+  "paidWith": null,
   "createdAt": 1786094880000,
   "updatedAt": 1786094898582
 }
 ```
+
+`paidWith` is the buyer's side of the payment: for each path payment on the
+link, the asset and amount the buyer actually spent to deliver `paidAmount` of
+`asset`. A buyer who spent 24.12 XLM to deliver 10 USDC gets
+`"paidWith": [{ "asset": { "code": "XLM", "issuer": null }, "amount": "24.12" }]`.
+It is `null` when every payment was a plain payment (the buyer spent the asset
+shown in `asset`), including links paid before Quay recorded the buyer's side.
 
 ### Verifying a receipt without trusting this API
 

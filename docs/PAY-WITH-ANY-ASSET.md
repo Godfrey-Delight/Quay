@@ -86,7 +86,7 @@ Path payments are configured in the API environment (`apps/api/src/env.ts`):
 Path payments interact with live liquidity pools and decentralized order books. To ensure
 reliability before enabling the flag on mainnet:
 1. The nightly testnet probe (`apps/api/test/live/path-payment.live.test.ts`, run via
-   `.github/workflows/anchor-probe.yml`) must run cleanly and report green.
+   `.github/workflows/path-payment-probe.yml`) must run cleanly and report green.
 2. The probe exercises the complete flow on testnet: self-seeding SDEX liquidity,
    generating quotes, verifying `price_moved` rejection when `sendMax` is reduced,
    submitting valid `path_payment_strict_receive` transactions, and verifying that the
